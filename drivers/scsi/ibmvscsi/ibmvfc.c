@@ -807,6 +807,13 @@ static int ibmvfc_init_event_pool(struct ibmvfc_host *vhost,
 	for (i = 0; i < size; ++i) {
 		struct ibmvfc_event *evt = &pool->events[i];
 
+		/*
+		 * evt->active states
+		 *  1 = in flight
+		 *  0 = being completed
+		 * -1 = free/freed
+		 */
+		atomic_set(&evt->active, -1);
 		atomic_set(&evt->free, 1);
 		evt->crq.valid = 0x80;
 		evt->crq.ioba = cpu_to_be64(pool->iu_token + (sizeof(*evt->xfer_iu) * i));
@@ -1017,6 +1024,7 @@ static void ibmvfc_free_event(struct ibmvfc_event *evt)
 
 	BUG_ON(!ibmvfc_valid_event(pool, evt));
 	BUG_ON(atomic_inc_return(&evt->free) != 1);
+	BUG_ON(atomic_dec_and_test(&evt->active));
 
 	spin_lock_irqsave(&evt->queue->l_lock, flags);
 	list_add_tail(&evt->queue_list, &evt->queue->free);
@@ -1038,7 +1046,7 @@ static void ibmvfc_scsi_eh_done(struct ibmvfc_event *evt)
 
 	if (cmnd) {
 		scsi_dma_unmap(cmnd);
-		cmnd->scsi_done(cmnd);
+		scsi_done(cmnd);
 	}
 
 	ibmvfc_free_event(evt);
@@ -1072,6 +1080,12 @@ static void ibmvfc_complete_purge(struct list_head *purge_list)
  **/
 static void ibmvfc_fail_request(struct ibmvfc_event *evt, int error_code)
 {
+	/*
+	 * Anything we are failing should still be active. Otherwise, it
+	 * implies we already got a response for the command and are doing
+	 * something bad like double completing it.
+	 */
+	BUG_ON(!atomic_dec_and_test(&evt->active));
 	if (evt->cmnd) {
 		evt->cmnd->result = (error_code << 16);
 		evt->done = ibmvfc_scsi_eh_done;
@@ -1682,6 +1696,7 @@ static int ibmvfc_send_event(struct ibmvfc_event *evt,
 
 	spin_lock_irqsave(&evt->queue->l_lock, flags);
 	list_add_tail(&evt->queue_list, &evt->queue->sent);
+	atomic_set(&evt->active, 1);
 
 	mb();
 
@@ -1696,6 +1711,7 @@ static int ibmvfc_send_event(struct ibmvfc_event *evt,
 				     be64_to_cpu(crq_as_u64[1]));
 
 	if (rc) {
+		atomic_set(&evt->active, 0);
 		list_del(&evt->queue_list);
 		spin_unlock_irqrestore(&evt->queue->l_lock, flags);
 		del_timer(&evt->timer);
@@ -1833,7 +1849,7 @@ static void ibmvfc_scsi_done(struct ibmvfc_event *evt)
 			cmnd->result = (DID_ERROR << 16);
 
 		scsi_dma_unmap(cmnd);
-		cmnd->scsi_done(cmnd);
+		scsi_done(cmnd);
 	}
 
 	ibmvfc_free_event(evt);
@@ -1911,7 +1927,7 @@ static int ibmvfc_queuecommand(struct Scsi_Host *shost, struct scsi_cmnd *cmnd)
 	struct ibmvfc_cmd *vfc_cmd;
 	struct ibmvfc_fcp_cmd_iu *iu;
 	struct ibmvfc_event *evt;
-	u32 tag_and_hwq = blk_mq_unique_tag(cmnd->request);
+	u32 tag_and_hwq = blk_mq_unique_tag(scsi_cmd_to_rq(cmnd));
 	u16 hwq = blk_mq_unique_tag_to_hwq(tag_and_hwq);
 	u16 scsi_channel;
 	int rc;
@@ -1919,7 +1935,7 @@ static int ibmvfc_queuecommand(struct Scsi_Host *shost, struct scsi_cmnd *cmnd)
 	if (unlikely((rc = fc_remote_port_chkready(rport))) ||
 	    unlikely((rc = ibmvfc_host_chkready(vhost)))) {
 		cmnd->result = rc;
-		cmnd->scsi_done(cmnd);
+		scsi_done(cmnd);
 		return 0;
 	}
 
@@ -1941,7 +1957,7 @@ static int ibmvfc_queuecommand(struct Scsi_Host *shost, struct scsi_cmnd *cmnd)
 	memcpy(iu->cdb, cmnd->cmnd, cmnd->cmd_len);
 
 	if (cmnd->flags & SCMD_TAGGED) {
-		vfc_cmd->task_tag = cpu_to_be64(cmnd->tag);
+		vfc_cmd->task_tag = cpu_to_be64(scsi_cmd_to_rq(cmnd)->tag);
 		iu->pri_task_attr = IBMVFC_SIMPLE_TASK;
 	}
 
@@ -1959,7 +1975,7 @@ static int ibmvfc_queuecommand(struct Scsi_Host *shost, struct scsi_cmnd *cmnd)
 			    "Failed to map DMA buffer for command. rc=%d\n", rc);
 
 	cmnd->result = DID_ERROR << 16;
-	cmnd->scsi_done(cmnd);
+	scsi_done(cmnd);
 	return 0;
 }
 
@@ -3251,7 +3267,7 @@ static void ibmvfc_handle_crq(struct ibmvfc_crq *crq, struct ibmvfc_host *vhost,
 		return;
 	}
 
-	if (unlikely(atomic_read(&evt->free))) {
+	if (unlikely(atomic_dec_if_positive(&evt->active))) {
 		dev_err(vhost->dev, "Received duplicate correlation_token 0x%08llx!\n",
 			crq->ioba);
 		return;
@@ -3277,14 +3293,18 @@ static int ibmvfc_scan_finished(struct Scsi_Host *shost, unsigned long time)
 	int done = 0;
 
 	spin_lock_irqsave(shost->host_lock, flags);
-	if (time >= (init_timeout * HZ)) {
+	if (!vhost->scan_timeout)
+		done = 1;
+	else if (time >= (vhost->scan_timeout * HZ)) {
 		dev_info(vhost->dev, "Scan taking longer than %d seconds, "
-			 "continuing initialization\n", init_timeout);
+			 "continuing initialization\n", vhost->scan_timeout);
 		done = 1;
 	}
 
-	if (vhost->scan_complete)
+	if (vhost->scan_complete) {
+		vhost->scan_timeout = init_timeout;
 		done = 1;
+	}
 	spin_unlock_irqrestore(shost->host_lock, flags);
 	return done;
 }
@@ -3569,17 +3589,19 @@ static struct bin_attribute ibmvfc_trace_attr = {
 };
 #endif
 
-static struct device_attribute *ibmvfc_attrs[] = {
-	&dev_attr_partition_name,
-	&dev_attr_device_name,
-	&dev_attr_port_loc_code,
-	&dev_attr_drc_name,
-	&dev_attr_npiv_version,
-	&dev_attr_capabilities,
-	&dev_attr_log_level,
-	&dev_attr_nr_scsi_channels,
+static struct attribute *ibmvfc_host_attrs[] = {
+	&dev_attr_partition_name.attr,
+	&dev_attr_device_name.attr,
+	&dev_attr_port_loc_code.attr,
+	&dev_attr_drc_name.attr,
+	&dev_attr_npiv_version.attr,
+	&dev_attr_capabilities.attr,
+	&dev_attr_log_level.attr,
+	&dev_attr_nr_scsi_channels.attr,
 	NULL
 };
+
+ATTRIBUTE_GROUPS(ibmvfc_host);
 
 static struct scsi_host_template driver_template = {
 	.module = THIS_MODULE,
@@ -3601,7 +3623,7 @@ static struct scsi_host_template driver_template = {
 	.this_id = -1,
 	.sg_tablesize = SG_ALL,
 	.max_sectors = IBMVFC_MAX_SECTORS,
-	.shost_attrs = ibmvfc_attrs,
+	.shost_groups = ibmvfc_host_groups,
 	.track_queue_depth = 1,
 	.host_tagset = 1,
 };
@@ -3778,7 +3800,7 @@ static void ibmvfc_handle_scrq(struct ibmvfc_crq *crq, struct ibmvfc_host *vhost
 		return;
 	}
 
-	if (unlikely(atomic_read(&evt->free))) {
+	if (unlikely(atomic_dec_if_positive(&evt->active))) {
 		dev_err(vhost->dev, "Received duplicate correlation_token 0x%08llx!\n",
 			crq->ioba);
 		return;
@@ -6069,6 +6091,7 @@ static int ibmvfc_probe(struct vio_dev *vdev, const struct vio_device_id *id)
 	vhost->client_scsi_channels = min(shost->nr_hw_queues, nr_scsi_channels);
 	vhost->using_channels = 0;
 	vhost->do_enquiry = 1;
+	vhost->scan_timeout = 0;
 
 	strcpy(vhost->partition_name, "UNKNOWN");
 	init_waitqueue_head(&vhost->work_wait_q);

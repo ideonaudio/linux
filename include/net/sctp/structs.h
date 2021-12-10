@@ -984,6 +984,7 @@ struct sctp_transport {
 	} cacc;
 
 	struct {
+		__u32 last_rtx_chunks;
 		__u16 pmtu;
 		__u16 probe_size;
 		__u16 probe_high;
@@ -1024,8 +1025,8 @@ bool sctp_transport_update_pmtu(struct sctp_transport *t, u32 pmtu);
 void sctp_transport_immediate_rtx(struct sctp_transport *);
 void sctp_transport_dst_release(struct sctp_transport *t);
 void sctp_transport_dst_confirm(struct sctp_transport *t);
-void sctp_transport_pl_send(struct sctp_transport *t);
-void sctp_transport_pl_recv(struct sctp_transport *t);
+bool sctp_transport_pl_send(struct sctp_transport *t);
+bool sctp_transport_pl_recv(struct sctp_transport *t);
 
 
 /* This is the structure we use to queue packets as they come into
@@ -1354,16 +1355,6 @@ struct sctp_endpoint {
 	      reconf_enable:1;
 
 	__u8  strreset_enable;
-
-	/* Security identifiers from incoming (INIT). These are set by
-	 * security_sctp_assoc_request(). These will only be used by
-	 * SCTP TCP type sockets and peeled off connections as they
-	 * cause a new socket to be generated. security_sctp_sk_clone()
-	 * will then plug these into the new socket.
-	 */
-
-	u32 secid;
-	u32 peer_secid;
 };
 
 /* Recover the outter endpoint structure. */
@@ -2102,6 +2093,16 @@ struct sctp_association {
 
 	__u64 abandoned_unsent[SCTP_PR_INDEX(MAX) + 1];
 	__u64 abandoned_sent[SCTP_PR_INDEX(MAX) + 1];
+
+	/* Security identifiers from incoming (INIT). These are set by
+	 * security_sctp_assoc_request(). These will only be used by
+	 * SCTP TCP type sockets and peeled off connections as they
+	 * cause a new socket to be generated. security_sctp_sk_clone()
+	 * will then plug these into the new socket.
+	 */
+
+	u32 secid;
+	u32 peer_secid;
 
 	struct rcu_head rcu;
 };
