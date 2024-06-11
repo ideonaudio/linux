@@ -6,7 +6,6 @@
  * figure. Its a silly number but people think its important. We go through
  * great pains to make it work on big machines and tickless kernels.
  */
-#include "sched.h"
 
 /*
  * Global load-average calculations
@@ -380,7 +379,7 @@ void calc_global_load(void)
 }
 
 /*
- * Called from scheduler_tick() to periodically update this CPU's
+ * Called from sched_tick() to periodically update this CPU's
  * active count.
  */
 void calc_global_load_tick(struct rq *this_rq)

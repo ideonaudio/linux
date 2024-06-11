@@ -55,7 +55,7 @@ static void hubp201_program_surface_config(
 	hubp1_program_pixel_format(hubp, format);
 }
 
-void hubp201_program_deadline(
+static void hubp201_program_deadline(
 		struct hubp *hubp,
 		struct _vcs_dpi_display_dlg_regs_st *dlg_attr,
 		struct _vcs_dpi_display_ttu_regs_st *ttu_attr)
@@ -63,9 +63,8 @@ void hubp201_program_deadline(
 	hubp1_program_deadline(hubp, dlg_attr, ttu_attr);
 }
 
-void hubp201_program_requestor(
-		struct hubp *hubp,
-		struct _vcs_dpi_display_rq_regs_st *rq_regs)
+static void hubp201_program_requestor(struct hubp *hubp,
+				      struct _vcs_dpi_display_rq_regs_st *rq_regs)
 {
 	struct dcn201_hubp *hubp201 = TO_DCN201_HUBP(hubp);
 
@@ -78,6 +77,7 @@ void hubp201_program_requestor(
 			MRQ_EXPANSION_MODE, rq_regs->mrq_expansion_mode,
 			CRQ_EXPANSION_MODE, rq_regs->crq_expansion_mode);
 
+	/* no need to program PTE */
 	REG_SET_5(DCHUBP_REQ_SIZE_CONFIG, 0,
 		CHUNK_SIZE, rq_regs->rq_regs_l.chunk_size,
 		MIN_CHUNK_SIZE, rq_regs->rq_regs_l.min_chunk_size,
@@ -100,6 +100,10 @@ static void hubp201_setup(
 		struct _vcs_dpi_display_rq_regs_st *rq_regs,
 		struct _vcs_dpi_display_pipe_dest_params_st *pipe_dest)
 {
+	/*
+	 * otg is locked when this func is called. Register are double buffered.
+	 * disable the requestors is not needed
+	 */
 	hubp2_vready_at_or_After_vsync(hubp, pipe_dest);
 	hubp201_program_requestor(hubp, rq_regs);
 	hubp201_program_deadline(hubp, dlg_attr, ttu_attr);

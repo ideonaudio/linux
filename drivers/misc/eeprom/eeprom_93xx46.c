@@ -14,7 +14,6 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
-#include <linux/of_gpio.h>
 #include <linux/slab.h>
 #include <linux/spi/spi.h>
 #include <linux/nvmem-provider.h>
@@ -555,14 +554,12 @@ static int eeprom_93xx46_probe(struct spi_device *spi)
 	return 0;
 }
 
-static int eeprom_93xx46_remove(struct spi_device *spi)
+static void eeprom_93xx46_remove(struct spi_device *spi)
 {
 	struct eeprom_93xx46_dev *edev = spi_get_drvdata(spi);
 
 	if (!(edev->pdata->flags & EE_READONLY))
 		device_remove_file(&spi->dev, &dev_attr_erase);
-
-	return 0;
 }
 
 static struct spi_driver eeprom_93xx46_driver = {
@@ -581,5 +578,3 @@ MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Driver for 93xx46 EEPROMs");
 MODULE_AUTHOR("Anatolij Gustschin <agust@denx.de>");
 MODULE_ALIAS("spi:93xx46");
-MODULE_ALIAS("spi:eeprom-93xx46");
-MODULE_ALIAS("spi:93lc46b");

@@ -27,7 +27,7 @@ static int process_stat_config_event(struct perf_tool *tool __maybe_unused,
 				     struct machine *machine __maybe_unused)
 {
 	struct perf_record_stat_config *config = &event->stat_config;
-	struct perf_stat_config stat_config;
+	struct perf_stat_config stat_config = {};
 
 #define HAS(term, val) \
 	has_term(config, PERF_STAT_CONFIG_TERM__##term, val)
@@ -87,7 +87,8 @@ static int test__synthesize_stat(struct test_suite *test __maybe_unused, int sub
 	count.run = 300;
 
 	TEST_ASSERT_VAL("failed to synthesize stat_config",
-		!perf_event__synthesize_stat(NULL, 1, 2, 3, &count, process_stat_event, NULL));
+			!perf_event__synthesize_stat(NULL, (struct perf_cpu){.cpu = 1}, 2, 3,
+						     &count, process_stat_event, NULL));
 
 	return 0;
 }

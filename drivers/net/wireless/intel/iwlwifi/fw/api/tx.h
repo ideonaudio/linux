@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause */
 /*
- * Copyright (C) 2012-2014, 2018-2021 Intel Corporation
+ * Copyright (C) 2012-2014, 2018-2024 Intel Corporation
  * Copyright (C) 2016-2017 Intel Deutschland GmbH
  */
 #ifndef __iwl_fw_api_tx_h__
@@ -76,6 +76,8 @@ enum iwl_tx_flags {
  *	to a secured STA
  * @IWL_TX_FLAGS_HIGH_PRI: high priority frame (like EAPOL) - can affect rate
  *	selection, retry limits and BT kill
+ * @IWL_TX_FLAGS_RTS: firmware used an RTS
+ * @IWL_TX_FLAGS_CTS: firmware used CTS-to-self
  */
 enum iwl_tx_cmd_flags {
 	IWL_TX_FLAGS_CMD_RATE		= BIT(0),
@@ -285,8 +287,7 @@ struct iwl_tx_cmd_gen2 {
  * @dram_info: FW internal DRAM storage
  * @rate_n_flags: rate for *all* Tx attempts, if TX_CMD_FLG_STA_RATE_MSK is
  *	cleared. Combination of RATE_MCS_*
- * @ttl: time to live - packet lifetime limit. The FW should drop if
- *	passed.
+ * @reserved: reserved
  * @hdr: 802.11 header
  */
 struct iwl_tx_cmd_gen3 {
@@ -295,7 +296,7 @@ struct iwl_tx_cmd_gen3 {
 	__le32 offload_assist;
 	struct iwl_dram_sec_info dram_info;
 	__le32 rate_n_flags;
-	__le64 ttl;
+	u8 reserved[8];
 	struct ieee80211_hdr hdr[];
 } __packed; /* TX_CMD_API_S_VER_8,
 	       TX_CMD_API_S_VER_10 */
@@ -790,9 +791,10 @@ enum iwl_mac_beacon_flags {
  *	is &enum iwl_mac_beacon_flags.
  * @short_ssid: Short SSID
  * @reserved: reserved
- * @template_id: currently equal to the mac context id of the coresponding mac.
+ * @link_id: the firmware id of the link that will use this beacon
  * @tim_idx: the offset of the tim IE in the beacon
- * @tim_size: the length of the tim IE
+ * @tim_size: the length of the tim IE (version < 14)
+ * @btwt_offset: offset to the broadcast TWT IE if present (version >= 14)
  * @ecsa_offset: offset to the ECSA IE if present
  * @csa_offset: offset to the CSA IE if present
  * @frame: the template of the beacon frame
@@ -802,15 +804,21 @@ struct iwl_mac_beacon_cmd {
 	__le16 flags;
 	__le32 short_ssid;
 	__le32 reserved;
-	__le32 template_id;
+	__le32 link_id;
 	__le32 tim_idx;
-	__le32 tim_size;
+	union {
+		__le32 tim_size;
+		__le32 btwt_offset;
+	};
 	__le32 ecsa_offset;
 	__le32 csa_offset;
 	struct ieee80211_hdr frame[];
 } __packed; /* BEACON_TEMPLATE_CMD_API_S_VER_10,
-	       BEACON_TEMPLATE_CMD_API_S_VER_11,
-	       BEACON_TEMPLATE_CMD_API_S_VER_12 */
+	     * BEACON_TEMPLATE_CMD_API_S_VER_11,
+	     * BEACON_TEMPLATE_CMD_API_S_VER_12,
+	     * BEACON_TEMPLATE_CMD_API_S_VER_13,
+	     * BEACON_TEMPLATE_CMD_API_S_VER_14
+	     */
 
 struct iwl_beacon_notif {
 	struct iwl_mvm_tx_resp beacon_notify_hdr;
@@ -883,6 +891,7 @@ struct iwl_tx_path_flush_cmd {
 
 /**
  * struct iwl_flush_queue_info - virtual flush queue info
+ * @tid: the tid to flush
  * @queue_num: virtual queue id
  * @read_before_flush: read pointer before flush
  * @read_after_flush: read pointer after flush
@@ -896,6 +905,7 @@ struct iwl_flush_queue_info {
 
 /**
  * struct iwl_tx_path_flush_cmd_rsp -- queue/FIFO flush command response
+ * @sta_id: the station for which the queue was flushed
  * @num_flushed_queues: number of queues in queues array
  * @queues: all flushed queues
  */

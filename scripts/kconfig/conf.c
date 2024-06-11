@@ -14,6 +14,7 @@
 #include <sys/time.h>
 #include <errno.h>
 
+#include "internal.h"
 #include "lkc.h"
 
 static void conf(struct menu *menu);
@@ -35,6 +36,7 @@ enum input_mode {
 	olddefconfig,
 	yes2modconfig,
 	mod2yesconfig,
+	mod2noconfig,
 };
 static enum input_mode input_mode = oldaskconfig;
 static int input_mode_opt;
@@ -163,8 +165,6 @@ enum conf_def_mode {
 	def_default,
 	def_yes,
 	def_mod,
-	def_y2m,
-	def_m2y,
 	def_no,
 	def_random
 };
@@ -172,7 +172,7 @@ enum conf_def_mode {
 static bool conf_set_all_new_symbols(enum conf_def_mode mode)
 {
 	struct symbol *sym, *csym;
-	int i, cnt;
+	int cnt;
 	/*
 	 * can't go as the default in switch-case below, otherwise gcc whines
 	 * about -Wmaybe-uninitialized
@@ -227,7 +227,7 @@ static bool conf_set_all_new_symbols(enum conf_def_mode mode)
 		}
 	}
 
-	for_all_symbols(i, sym) {
+	for_all_symbols(sym) {
 		if (sym_has_value(sym) || sym->flags & SYMBOL_VALID)
 			continue;
 		switch (sym_get_type(sym)) {
@@ -279,14 +279,14 @@ static bool conf_set_all_new_symbols(enum conf_def_mode mode)
 	 * and the rest to no.
 	 */
 	if (mode != def_random) {
-		for_all_symbols(i, csym) {
+		for_all_symbols(csym) {
 			if ((sym_is_choice(csym) && !sym_has_value(csym)) ||
 			    sym_is_choice_value(csym))
 				csym->flags |= SYMBOL_NEED_SET_CHOICE_VALUES;
 		}
 	}
 
-	for_all_symbols(i, csym) {
+	for_all_symbols(csym) {
 		if (sym_has_value(csym) || !sym_is_choice(csym))
 			continue;
 
@@ -302,14 +302,11 @@ static bool conf_set_all_new_symbols(enum conf_def_mode mode)
 	return has_changed;
 }
 
-static void conf_rewrite_mod_or_yes(enum conf_def_mode mode)
+static void conf_rewrite_tristates(tristate old_val, tristate new_val)
 {
 	struct symbol *sym;
-	int i;
-	tristate old_val = (mode == def_y2m) ? yes : mod;
-	tristate new_val = (mode == def_y2m) ? mod : yes;
 
-	for_all_symbols(i, sym) {
+	for_all_symbols(sym) {
 		if (sym_get_type(sym) == S_TRISTATE &&
 		    sym->def[S_DEF_USER].tri == old_val)
 			sym->def[S_DEF_USER].tri = new_val;
@@ -449,7 +446,7 @@ help:
 	}
 }
 
-static int conf_choice(struct menu *menu)
+static void conf_choice(struct menu *menu)
 {
 	struct symbol *sym, *def_sym;
 	struct menu *child;
@@ -462,19 +459,18 @@ static int conf_choice(struct menu *menu)
 		sym_calc_value(sym);
 		switch (sym_get_tristate_value(sym)) {
 		case no:
-			return 1;
 		case mod:
-			return 0;
+			return;
 		case yes:
 			break;
 		}
 	} else {
 		switch (sym_get_tristate_value(sym)) {
 		case no:
-			return 1;
+			return;
 		case mod:
 			printf("%*s%s\n", indent - 1, "", menu_get_prompt(menu));
-			return 0;
+			return;
 		case yes:
 			break;
 		}
@@ -500,9 +496,8 @@ static int conf_choice(struct menu *menu)
 				printf("%*c", indent, '>');
 			} else
 				printf("%*c", indent, ' ');
-			printf(" %d. %s", cnt, menu_get_prompt(child));
-			if (child->sym->name)
-				printf(" (%s)", child->sym->name);
+			printf(" %d. %s (%s)", cnt, menu_get_prompt(child),
+			       child->sym->name);
 			if (!sym_has_value(child->sym))
 				printf(" (NEW)");
 			printf("\n");
@@ -554,13 +549,8 @@ static int conf_choice(struct menu *menu)
 			print_help(child);
 			continue;
 		}
-		sym_set_choice_value(sym, child->sym);
-		for (child = child->list; child; child = child->next) {
-			indent += 2;
-			conf(child);
-			indent -= 2;
-		}
-		return 1;
+		sym_set_tristate_value(child->sym, yes);
+		return;
 	}
 }
 
@@ -685,6 +675,7 @@ static const struct option long_opts[] = {
 	{"olddefconfig",  no_argument,       &input_mode_opt, olddefconfig},
 	{"yes2modconfig", no_argument,       &input_mode_opt, yes2modconfig},
 	{"mod2yesconfig", no_argument,       &input_mode_opt, mod2yesconfig},
+	{"mod2noconfig",  no_argument,       &input_mode_opt, mod2noconfig},
 	{NULL, 0, NULL, 0}
 };
 
@@ -713,6 +704,7 @@ static void conf_usage(const char *progname)
 	printf("  --randconfig            New config with random answer to all options\n");
 	printf("  --yes2modconfig         Change answers from yes to mod if possible\n");
 	printf("  --mod2yesconfig         Change answers from mod to yes if possible\n");
+	printf("  --mod2noconfig          Change answers from mod to no if possible\n");
 	printf("  (If none of the above is given, --oldaskconfig is the default)\n");
 }
 
@@ -788,6 +780,7 @@ int main(int ac, char **av)
 	case olddefconfig:
 	case yes2modconfig:
 	case mod2yesconfig:
+	case mod2noconfig:
 		conf_read(NULL);
 		break;
 	case allnoconfig:
@@ -827,6 +820,9 @@ int main(int ac, char **av)
 		break;
 	}
 
+	if (conf_errors())
+		exit(1);
+
 	if (sync_kconfig) {
 		name = getenv("KCONFIG_NOSILENTUPDATE");
 		if (name && *name) {
@@ -862,10 +858,13 @@ int main(int ac, char **av)
 	case savedefconfig:
 		break;
 	case yes2modconfig:
-		conf_rewrite_mod_or_yes(def_y2m);
+		conf_rewrite_tristates(yes, mod);
 		break;
 	case mod2yesconfig:
-		conf_rewrite_mod_or_yes(def_m2y);
+		conf_rewrite_tristates(mod, yes);
+		break;
+	case mod2noconfig:
+		conf_rewrite_tristates(mod, no);
 		break;
 	case oldaskconfig:
 		rootEntry = &rootmenu;
@@ -886,6 +885,9 @@ int main(int ac, char **av)
 	default:
 		break;
 	}
+
+	if (sym_dep_errors())
+		exit(1);
 
 	if (input_mode == savedefconfig) {
 		if (conf_write_defconfig(defconfig_file)) {

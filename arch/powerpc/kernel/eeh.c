@@ -506,9 +506,18 @@ int eeh_dev_check_failure(struct eeh_dev *edev)
 	 * We will punt with the following conditions: Failure to get
 	 * PE's state, EEH not support and Permanently unavailable
 	 * state, PE is in good state.
+	 *
+	 * On the pSeries, after reaching the threshold, get_state might
+	 * return EEH_STATE_NOT_SUPPORT. However, it's possible that the
+	 * device state remains uncleared if the device is not marked
+	 * pci_channel_io_perm_failure. Therefore, consider logging the
+	 * event to let device removal happen.
+	 *
 	 */
 	if ((ret < 0) ||
-	    (ret == EEH_STATE_NOT_SUPPORT) || eeh_state_active(ret)) {
+	    (ret == EEH_STATE_NOT_SUPPORT &&
+	     dev->error_state == pci_channel_io_perm_failure) ||
+	    eeh_state_active(ret)) {
 		eeh_stats.false_positives++;
 		pe->false_positives++;
 		rc = 0;
@@ -1329,7 +1338,7 @@ int eeh_pe_set_option(struct eeh_pe *pe, int option)
 
 	/*
 	 * EEH functionality could possibly be disabled, just
-	 * return error for the case. And the EEH functinality
+	 * return error for the case. And the EEH functionality
 	 * isn't expected to be disabled on one specific PE.
 	 */
 	switch (option) {
@@ -1804,7 +1813,7 @@ static int eeh_debugfs_break_device(struct pci_dev *pdev)
 	 *    PE freeze. Using the in_8() accessor skips the eeh detection hook
 	 *    so the freeze hook so the EEH Detection machinery won't be
 	 *    triggered here. This is to match the usual behaviour of EEH
-	 *    where the HW will asyncronously freeze a PE and it's up to
+	 *    where the HW will asynchronously freeze a PE and it's up to
 	 *    the kernel to notice and deal with it.
 	 *
 	 * 3. Turn Memory space back on. This is more important for VFs

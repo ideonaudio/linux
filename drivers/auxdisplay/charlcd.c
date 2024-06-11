@@ -17,7 +17,9 @@
 #include <linux/uaccess.h>
 #include <linux/workqueue.h>
 
+#ifndef CONFIG_PANEL_BOOT_MESSAGE
 #include <generated/utsrelease.h>
+#endif
 
 #include "charlcd.h"
 
@@ -37,7 +39,7 @@ struct charlcd_priv {
 	bool must_clear;
 
 	/* contains the LCD config state */
-	unsigned long int flags;
+	unsigned long flags;
 
 	/* Current escape sequence and it's length or -1 if outside */
 	struct {
@@ -578,6 +580,9 @@ static int charlcd_init(struct charlcd *lcd)
 	 * Since charlcd_init_display() needs to write data, we have to
 	 * enable mark the LCD initialized just before.
 	 */
+	if (WARN_ON(!lcd->ops->init_display))
+		return -EINVAL;
+
 	ret = lcd->ops->init_display(lcd);
 	if (ret)
 		return ret;
@@ -675,4 +680,5 @@ int charlcd_unregister(struct charlcd *lcd)
 }
 EXPORT_SYMBOL_GPL(charlcd_unregister);
 
+MODULE_DESCRIPTION("Character LCD core support");
 MODULE_LICENSE("GPL");

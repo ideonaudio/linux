@@ -8,17 +8,13 @@
  */
 
 #include <linux/memblock.h>
-#include <linux/mmu_context.h>
 #include <linux/hugetlb.h>
+
 #include <asm/fixmap.h>
-#include <asm/code-patching.h>
-#include <asm/inst.h>
 
 #include <mm/mmu_decl.h>
 
 #define IMMR_SIZE (FIX_IMMR_SIZE << PAGE_SHIFT)
-
-extern int __map_without_ltlbs;
 
 static unsigned long block_mapped_ram;
 
@@ -32,8 +28,6 @@ phys_addr_t v_block_mapped(unsigned long va)
 
 	if (va >= VIRT_IMMR_BASE && va < VIRT_IMMR_BASE + IMMR_SIZE)
 		return p + va - VIRT_IMMR_BASE;
-	if (__map_without_ltlbs)
-		return 0;
 	if (va >= PAGE_OFFSET && va < PAGE_OFFSET + block_mapped_ram)
 		return __pa(va);
 	return 0;
@@ -49,8 +43,6 @@ unsigned long p_block_mapped(phys_addr_t pa)
 
 	if (pa >= p && pa < p + IMMR_SIZE)
 		return VIRT_IMMR_BASE + pa - p;
-	if (__map_without_ltlbs)
-		return 0;
 	if (pa < block_mapped_ram)
 		return (unsigned long)__va(pa);
 	return 0;
@@ -101,7 +93,8 @@ static int __ref __early_map_kernel_hugepage(unsigned long va, phys_addr_t pa,
 	if (new && WARN_ON(pte_present(*ptep) && pgprot_val(prot)))
 		return -EINVAL;
 
-	set_huge_pte_at(&init_mm, va, ptep, pte_mkhuge(pfn_pte(pa >> PAGE_SHIFT, prot)));
+	set_huge_pte_at(&init_mm, va, ptep,
+			pte_mkhuge(pfn_pte(pa >> PAGE_SHIFT, prot)), psize);
 
 	return 0;
 }
@@ -126,23 +119,26 @@ void __init mmu_mapin_immr(void)
 				    PAGE_KERNEL_NCG, MMU_PAGE_512K, true);
 }
 
-static void mmu_mapin_ram_chunk(unsigned long offset, unsigned long top,
-				pgprot_t prot, bool new)
+static int mmu_mapin_ram_chunk(unsigned long offset, unsigned long top,
+			       pgprot_t prot, bool new)
 {
 	unsigned long v = PAGE_OFFSET + offset;
 	unsigned long p = offset;
+	int err = 0;
 
 	WARN_ON(!IS_ALIGNED(offset, SZ_512K) || !IS_ALIGNED(top, SZ_512K));
 
-	for (; p < ALIGN(p, SZ_8M) && p < top; p += SZ_512K, v += SZ_512K)
-		__early_map_kernel_hugepage(v, p, prot, MMU_PAGE_512K, new);
-	for (; p < ALIGN_DOWN(top, SZ_8M) && p < top; p += SZ_8M, v += SZ_8M)
-		__early_map_kernel_hugepage(v, p, prot, MMU_PAGE_8M, new);
-	for (; p < ALIGN_DOWN(top, SZ_512K) && p < top; p += SZ_512K, v += SZ_512K)
-		__early_map_kernel_hugepage(v, p, prot, MMU_PAGE_512K, new);
+	for (; p < ALIGN(p, SZ_8M) && p < top && !err; p += SZ_512K, v += SZ_512K)
+		err = __early_map_kernel_hugepage(v, p, prot, MMU_PAGE_512K, new);
+	for (; p < ALIGN_DOWN(top, SZ_8M) && p < top && !err; p += SZ_8M, v += SZ_8M)
+		err = __early_map_kernel_hugepage(v, p, prot, MMU_PAGE_8M, new);
+	for (; p < ALIGN_DOWN(top, SZ_512K) && p < top && !err; p += SZ_512K, v += SZ_512K)
+		err = __early_map_kernel_hugepage(v, p, prot, MMU_PAGE_512K, new);
 
 	if (!new)
 		flush_tlb_kernel_range(PAGE_OFFSET + v, PAGE_OFFSET + top);
+
+	return err;
 }
 
 unsigned long __init mmu_mapin_ram(unsigned long base, unsigned long top)
@@ -156,9 +152,6 @@ unsigned long __init mmu_mapin_ram(unsigned long base, unsigned long top)
 	WARN_ON(top < einittext8);
 
 	mmu_mapin_immr();
-
-	if (__map_without_ltlbs)
-		return 0;
 
 	mmu_mapin_ram_chunk(0, boundary, PAGE_KERNEL_TEXT, true);
 	if (debug_pagealloc_enabled_or_kfence()) {
@@ -176,27 +169,33 @@ unsigned long __init mmu_mapin_ram(unsigned long base, unsigned long top)
 	return top;
 }
 
-void mmu_mark_initmem_nx(void)
+int mmu_mark_initmem_nx(void)
 {
 	unsigned long etext8 = ALIGN(__pa(_etext), SZ_8M);
 	unsigned long sinittext = __pa(_sinittext);
 	unsigned long boundary = strict_kernel_rwx_enabled() ? sinittext : etext8;
 	unsigned long einittext8 = ALIGN(__pa(_einittext), SZ_8M);
+	int err = 0;
 
-	mmu_mapin_ram_chunk(0, boundary, PAGE_KERNEL_TEXT, false);
-	mmu_mapin_ram_chunk(boundary, einittext8, PAGE_KERNEL, false);
+	if (!debug_pagealloc_enabled_or_kfence())
+		err = mmu_mapin_ram_chunk(boundary, einittext8, PAGE_KERNEL, false);
 
 	mmu_pin_tlb(block_mapped_ram, false);
+
+	return err;
 }
 
 #ifdef CONFIG_STRICT_KERNEL_RWX
-void mmu_mark_rodata_ro(void)
+int mmu_mark_rodata_ro(void)
 {
 	unsigned long sinittext = __pa(_sinittext);
+	int err;
 
-	mmu_mapin_ram_chunk(0, sinittext, PAGE_KERNEL_ROX, false);
+	err = mmu_mapin_ram_chunk(0, sinittext, PAGE_KERNEL_ROX, false);
 	if (IS_ENABLED(CONFIG_PIN_TLB_DATA))
 		mmu_pin_tlb(block_mapped_ram, true);
+
+	return err;
 }
 #endif
 
@@ -211,35 +210,6 @@ void __init setup_initial_memory_limit(phys_addr_t first_memblock_base,
 	/* 8xx can only access 32MB at the moment */
 	memblock_set_current_limit(min_t(u64, first_memblock_size, SZ_32M));
 }
-
-#ifdef CONFIG_PPC_KUEP
-void __init setup_kuep(bool disabled)
-{
-	if (disabled)
-		return;
-
-	pr_info("Activating Kernel Userspace Execution Prevention\n");
-
-	mtspr(SPRN_MI_AP, MI_APG_KUEP);
-}
-#endif
-
-#ifdef CONFIG_PPC_KUAP
-struct static_key_false disable_kuap_key;
-EXPORT_SYMBOL(disable_kuap_key);
-
-void __init setup_kuap(bool disabled)
-{
-	if (disabled) {
-		static_branch_enable(&disable_kuap_key);
-		return;
-	}
-
-	pr_info("Activating Kernel Userspace Access Protection\n");
-
-	mtspr(SPRN_MD_AP, MD_APG_KUAP);
-}
-#endif
 
 int pud_clear_huge(pud_t *pud)
 {

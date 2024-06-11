@@ -7,13 +7,13 @@
  */
 
 #include <linux/kernel_stat.h>
-#include <linux/sched/cputime.h>
 #include <linux/export.h>
 #include <linux/kernel.h>
 #include <linux/timex.h>
 #include <linux/types.h>
 #include <linux/time.h>
 #include <asm/alternative.h>
+#include <asm/cputime.h>
 #include <asm/vtimer.h>
 #include <asm/vtime.h>
 #include <asm/cpu_mf.h>
@@ -32,14 +32,6 @@ DEFINE_PER_CPU(u64, mt_cycles[8]);
 static DEFINE_PER_CPU(u64, mt_scaling_mult) = { 1 };
 static DEFINE_PER_CPU(u64, mt_scaling_div) = { 1 };
 static DEFINE_PER_CPU(u64, mt_scaling_jiffies);
-
-static inline u64 get_vtimer(void)
-{
-	u64 timer;
-
-	asm volatile("stpt %0" : "=Q" (timer));
-	return timer;
-}
 
 static inline void set_vtimer(u64 expires)
 {
@@ -128,13 +120,12 @@ static int do_account_vtime(struct task_struct *tsk)
 
 	timer = S390_lowcore.last_update_timer;
 	clock = S390_lowcore.last_update_clock;
-	/* Use STORE CLOCK by default, STORE CLOCK FAST if available. */
-	alternative_io("stpt %0\n .insn s,0xb2050000,%1\n",
-		       "stpt %0\n .insn s,0xb27c0000,%1\n",
-		       25,
-		       ASM_OUTPUT2("=Q" (S390_lowcore.last_update_timer),
-				   "=Q" (S390_lowcore.last_update_clock)),
-		       ASM_NO_INPUT_CLOBBER("cc"));
+	asm volatile(
+		"	stpt	%0\n"	/* Store current cpu timer value */
+		"	stckf	%1"	/* Store current tod clock value */
+		: "=Q" (S390_lowcore.last_update_timer),
+		  "=Q" (S390_lowcore.last_update_clock)
+		: : "cc");
 	clock = S390_lowcore.last_update_clock - clock;
 	timer -= S390_lowcore.last_update_timer;
 
@@ -211,20 +202,20 @@ void vtime_flush(struct task_struct *tsk)
 		virt_timer_expire();
 
 	steal = S390_lowcore.steal_timer;
-	avg_steal = S390_lowcore.avg_steal_timer / 2;
+	avg_steal = S390_lowcore.avg_steal_timer;
 	if ((s64) steal > 0) {
 		S390_lowcore.steal_timer = 0;
 		account_steal_time(cputime_to_nsecs(steal));
 		avg_steal += steal;
 	}
-	S390_lowcore.avg_steal_timer = avg_steal;
+	S390_lowcore.avg_steal_timer = avg_steal / 2;
 }
 
 static u64 vtime_delta(void)
 {
 	u64 timer = S390_lowcore.last_update_timer;
 
-	S390_lowcore.last_update_timer = get_vtimer();
+	S390_lowcore.last_update_timer = get_cpu_timer();
 
 	return timer - S390_lowcore.last_update_timer;
 }

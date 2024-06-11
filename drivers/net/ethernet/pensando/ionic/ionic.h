@@ -18,7 +18,7 @@ struct ionic_lif;
 #define PCI_DEVICE_ID_PENSANDO_IONIC_ETH_PF	0x1002
 #define PCI_DEVICE_ID_PENSANDO_IONIC_ETH_VF	0x1003
 
-#define DEVCMD_TIMEOUT  10
+#define DEVCMD_TIMEOUT			5
 #define IONIC_ADMINQ_TIME_SLICE		msecs_to_jiffies(100)
 
 #define IONIC_PHC_UPDATE_NS	10000000000	    /* 10s in nanoseconds */
@@ -76,9 +76,13 @@ int ionic_adminq_post_wait(struct ionic_lif *lif, struct ionic_admin_ctx *ctx);
 int ionic_adminq_post_wait_nomsg(struct ionic_lif *lif, struct ionic_admin_ctx *ctx);
 void ionic_adminq_netdev_err_print(struct ionic_lif *lif, u8 opcode,
 				   u8 status, int err);
+bool ionic_notifyq_service(struct ionic_cq *cq);
+bool ionic_adminq_service(struct ionic_cq *cq);
 
 int ionic_dev_cmd_wait(struct ionic *ionic, unsigned long max_wait);
-int ionic_set_dma_mask(struct ionic *ionic);
+int ionic_dev_cmd_wait_nomsg(struct ionic *ionic, unsigned long max_wait);
+void ionic_dev_cmd_dev_err_print(struct ionic *ionic, u8 opcode, u8 status,
+				 int err);
 int ionic_setup(struct ionic *ionic);
 
 int ionic_identify(struct ionic *ionic);

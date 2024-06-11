@@ -29,6 +29,8 @@ static int node_to_pxm_map[MAX_NUMNODES]
 unsigned char acpi_srat_revision __initdata;
 static int acpi_numa __initdata;
 
+static int last_real_pxm;
+
 void __init disable_srat(void)
 {
 	acpi_numa = -1;
@@ -67,9 +69,9 @@ int acpi_map_pxm_to_node(int pxm)
 	node = pxm_to_node_map[pxm];
 
 	if (node == NUMA_NO_NODE) {
-		if (nodes_weight(nodes_found_map) >= MAX_NUMNODES)
-			return NUMA_NO_NODE;
 		node = first_unset_node(nodes_found_map);
+		if (node >= MAX_NUMNODES)
+			return NUMA_NO_NODE;
 		__acpi_map_pxm_to_node(pxm, node);
 		node_set(node, nodes_found_map);
 	}
@@ -183,7 +185,7 @@ static int __init slit_valid(struct acpi_table_slit *slit)
 	int i, j;
 	int d = slit->locality_count;
 	for (i = 0; i < d; i++) {
-		for (j = 0; j < d; j++)  {
+		for (j = 0; j < d; j++) {
 			u8 val = slit->entry[d*i + j];
 			if (i == j) {
 				if (val != LOCAL_DISTANCE)
@@ -206,15 +208,25 @@ int __init srat_disabled(void)
 	return acpi_numa < 0;
 }
 
-#if defined(CONFIG_X86) || defined(CONFIG_ARM64) || defined(CONFIG_LOONGARCH)
+__weak int __init numa_fill_memblks(u64 start, u64 end)
+{
+	return NUMA_NO_MEMBLK;
+}
+
 /*
  * Callback for SLIT parsing.  pxm_to_node() returns NUMA_NO_NODE for
  * I/O localities since SRAT does not list them.  I/O localities are
  * not supported at this point.
  */
-void __init acpi_numa_slit_init(struct acpi_table_slit *slit)
+static int __init acpi_parse_slit(struct acpi_table_header *table)
 {
+	struct acpi_table_slit *slit = (struct acpi_table_slit *)table;
 	int i, j;
+
+	if (!slit_valid(slit)) {
+		pr_info("SLIT table looks invalid. Not used.\n");
+		return -EINVAL;
+	}
 
 	for (i = 0; i < slit->locality_count; i++) {
 		const int from_node = pxm_to_node(i);
@@ -232,31 +244,36 @@ void __init acpi_numa_slit_init(struct acpi_table_slit *slit)
 				slit->entry[slit->locality_count * i + j]);
 		}
 	}
+
+	return 0;
 }
 
-/*
- * Default callback for parsing of the Proximity Domain <-> Memory
- * Area mappings
- */
-int __init
-acpi_numa_memory_affinity_init(struct acpi_srat_mem_affinity *ma)
+static int parsed_numa_memblks __initdata;
+
+static int __init
+acpi_parse_memory_affinity(union acpi_subtable_headers *header,
+			   const unsigned long table_end)
 {
+	struct acpi_srat_mem_affinity *ma;
 	u64 start, end;
 	u32 hotpluggable;
 	int node, pxm;
 
+	ma = (struct acpi_srat_mem_affinity *)header;
+
+	acpi_table_print_srat_entry(&header->common);
+
 	if (srat_disabled())
-		goto out_err;
+		return 0;
 	if (ma->header.length < sizeof(struct acpi_srat_mem_affinity)) {
 		pr_err("SRAT: Unexpected header length: %d\n",
 		       ma->header.length);
 		goto out_err_bad_srat;
 	}
 	if ((ma->flags & ACPI_SRAT_MEM_ENABLED) == 0)
-		goto out_err;
-	hotpluggable = ma->flags & ACPI_SRAT_MEM_HOT_PLUGGABLE;
-	if (hotpluggable && !IS_ENABLED(CONFIG_MEMORY_HOTPLUG))
-		goto out_err;
+		return 0;
+	hotpluggable = IS_ENABLED(CONFIG_MEMORY_HOTPLUG) &&
+		(ma->flags & ACPI_SRAT_MEM_HOT_PLUGGABLE);
 
 	start = ma->base_address;
 	end = start + ma->length;
@@ -292,24 +309,55 @@ acpi_numa_memory_affinity_init(struct acpi_srat_mem_affinity *ma)
 
 	max_possible_pfn = max(max_possible_pfn, PFN_UP(end - 1));
 
+	parsed_numa_memblks++;
+
 	return 0;
+
 out_err_bad_srat:
+	/* Just disable SRAT, but do not fail and ignore errors. */
 	bad_srat();
-out_err:
-	return -EINVAL;
+
+	return 0;
 }
-#endif /* defined(CONFIG_X86) || defined (CONFIG_ARM64) */
 
-static int __init acpi_parse_slit(struct acpi_table_header *table)
+static int __init acpi_parse_cfmws(union acpi_subtable_headers *header,
+				   void *arg, const unsigned long table_end)
 {
-	struct acpi_table_slit *slit = (struct acpi_table_slit *)table;
+	struct acpi_cedt_cfmws *cfmws;
+	int *fake_pxm = arg;
+	u64 start, end;
+	int node;
 
-	if (!slit_valid(slit)) {
-		pr_info("SLIT table looks invalid. Not used.\n");
+	cfmws = (struct acpi_cedt_cfmws *)header;
+	start = cfmws->base_hpa;
+	end = cfmws->base_hpa + cfmws->window_size;
+
+	/*
+	 * The SRAT may have already described NUMA details for all,
+	 * or a portion of, this CFMWS HPA range. Extend the memblks
+	 * found for any portion of the window to cover the entire
+	 * window.
+	 */
+	if (!numa_fill_memblks(start, end))
+		return 0;
+
+	/* No SRAT description. Create a new node. */
+	node = acpi_map_pxm_to_node(*fake_pxm);
+
+	if (node == NUMA_NO_NODE) {
+		pr_err("ACPI NUMA: Too many proximity domains while processing CFMWS.\n");
 		return -EINVAL;
 	}
-	acpi_numa_slit_init(slit);
 
+	if (numa_add_memblk(node, start, end) < 0) {
+		/* CXL driver must handle the NUMA_NO_NODE case */
+		pr_warn("ACPI NUMA: Failed to add memblk for CFMWS node %d [mem %#llx-%#llx]\n",
+			node, start, end);
+	}
+	node_set(node, numa_nodes_parsed);
+
+	/* Set the next available fake_pxm value */
+	(*fake_pxm)++;
 	return 0;
 }
 
@@ -384,7 +432,7 @@ acpi_parse_gi_affinity(union acpi_subtable_headers *header,
 		return -EINVAL;
 
 	node = acpi_map_pxm_to_node(gi_affinity->proximity_domain);
-	if (node == NUMA_NO_NODE || node >= MAX_NUMNODES) {
+	if (node == NUMA_NO_NODE) {
 		pr_err("SRAT: Too many proximity domains.\n");
 		return -EINVAL;
 	}
@@ -401,24 +449,6 @@ acpi_parse_gi_affinity(union acpi_subtable_headers *header,
 	return 0;
 }
 #endif /* defined(CONFIG_X86) || defined (CONFIG_ARM64) */
-
-static int __initdata parsed_numa_memblks;
-
-static int __init
-acpi_parse_memory_affinity(union acpi_subtable_headers * header,
-			   const unsigned long end)
-{
-	struct acpi_srat_mem_affinity *memory_affinity;
-
-	memory_affinity = (struct acpi_srat_mem_affinity *)header;
-
-	acpi_table_print_srat_entry(&header->common);
-
-	/* let architecture-dependent part to do it */
-	if (!acpi_numa_memory_affinity_init(memory_affinity))
-		parsed_numa_memblks++;
-	return 0;
-}
 
 static int __init acpi_parse_srat(struct acpi_table_header *table)
 {
@@ -442,7 +472,7 @@ acpi_table_parse_srat(enum acpi_srat_type id,
 
 int __init acpi_numa_init(void)
 {
-	int cnt = 0;
+	int i, fake_pxm, cnt = 0;
 
 	if (acpi_disabled)
 		return -EINVAL;
@@ -478,12 +508,37 @@ int __init acpi_numa_init(void)
 	/* SLIT: System Locality Information Table */
 	acpi_table_parse(ACPI_SIG_SLIT, acpi_parse_slit);
 
+	/*
+	 * CXL Fixed Memory Window Structures (CFMWS) must be parsed
+	 * after the SRAT. Create NUMA Nodes for CXL memory ranges that
+	 * are defined in the CFMWS and not already defined in the SRAT.
+	 * Initialize a fake_pxm as the first available PXM to emulate.
+	 */
+
+	/* fake_pxm is the next unused PXM value after SRAT parsing */
+	for (i = 0, fake_pxm = -1; i < MAX_NUMNODES; i++) {
+		if (node_to_pxm_map[i] > fake_pxm)
+			fake_pxm = node_to_pxm_map[i];
+	}
+	last_real_pxm = fake_pxm;
+	fake_pxm++;
+	acpi_table_parse_cedt(ACPI_CEDT_TYPE_CFMWS, acpi_parse_cfmws,
+			      &fake_pxm);
+
 	if (cnt < 0)
 		return cnt;
 	else if (!parsed_numa_memblks)
 		return -ENOENT;
 	return 0;
 }
+
+bool acpi_node_backed_by_real_pxm(int nid)
+{
+	int pxm = node_to_pxm(nid);
+
+	return pxm <= last_real_pxm;
+}
+EXPORT_SYMBOL_GPL(acpi_node_backed_by_real_pxm);
 
 static int acpi_get_pxm(acpi_handle h)
 {
